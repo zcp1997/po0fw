@@ -169,7 +169,7 @@ function apiCall(token, slot) {
   // 组装新接口 Query 参数
   var url = API_BASE + "?action=add&token=" + encodeURIComponent(fullToken);
 
-  return httpRequest("POST", {
+  return httpRequest("GET", {
     url: url,
     headers: { "Content-Type": "application/json" },
     body: "",
