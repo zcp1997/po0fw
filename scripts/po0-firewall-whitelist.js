@@ -3,10 +3,9 @@
  * 兼容：Surge / Stash / Shadowrocket / Loon / Quantumult X
  * （Egern 运行模型不同，用独立的 egern/po0-firewall-whitelist.js）
  *
- * POST /api/firewall/<token>/add  把"当前请求源 IP"加入白名单，并回显
- *   {enabled, whitelist:[{ip,slot}], limit, currentIp}。token 走 URL 路径，无需
- *   Authorization 头。服务端对已在白名单的 IP 做幂等处理（重复请求不
- *   重复占坑、不推进淘汰队列），因此这里每次直接无脑请求。
+ * GET/POST /api/firewall.php?action=add&token=<token>[@slot] 把"当前请求源 IP"加入白名单，并回显
+ *   {enabled, whitelist:[{ip,slot}], limit, currentIp}。
+ *   服务端对已在白名单的 IP 做幂等处理（重复请求不重复占坑、不推进淘汰队列），因此这里每次直接无脑请求。
  * 加白粒度为 C 段（/24）：服务端把 whitelist 条目和 currentIp 都归一化成
  *   x.x.x.0/24 回显；同段内换 IP 不产生新写入。脚本用 sameC24() 做匹配，
  *   兼容精确 IP 与 /24 段混杂的新旧格式。
@@ -16,7 +15,7 @@
  * - 每次直接 POST 上报当前出口 IP，蜂窝与 WiFi/有线同等处理。
  * - 默认 slotless 写入：按 updated_at 触发 LRU 淘汰，被挤出的设备靠自己的
  *   cron/事件几分钟内自动补回。
- * - 可选固定槽位：token 后加 @N（如 pgnfw_xxx@0）→ POST .../add?slot=N，
+ * - 可选固定槽位：token 后加 @N（如 pgnfw_xxx@0）→ POST ...?action=add&token=pgnfw_xxx@0，
  *   把本机 IP 钉在槽位 N，**永不被 LRU 淘汰**。槽位写入语义：
  *     · 本机 IP 已在该槽位 → 刷新 updated_at；
  *     · 槽位有旧 IP → 行级顶替，旧 IP 丢弃；
@@ -33,7 +32,8 @@
 
 var INLINE_TOKENS = "";
 
-var API_BASE = "https://124.221.69.228/api/firewall/"; // + <token> + "/add"
+// 替换为新接口地址
+var API_BASE = "https://console.po0.io/modules/servers/penguin/api/firewall.php";
 var STORE_PREFIX = "po0_fw_";
 var TOKENS_KEY = "po0fw_tokens";
 var HIST_WINDOW_MS = 24 * 3600 * 1000; // 📶 标记的记账窗口
@@ -86,18 +86,14 @@ function httpRequest(method, opts) {
 
 function getArgumentTokens() {
   if (typeof $argument === "undefined" || $argument === null) return "";
-  // Loon 插件 argument=[{tokens}] 会注入对象形态
   if (typeof $argument === "object") return String($argument.tokens || "");
   if (typeof $argument === "string" && $argument.length > 0) {
-    // Shadowrocket 等客户端可能把配置里的外层引号原样传入，先剥掉
     if (/^["'].*["']$/.test($argument)) $argument = $argument.slice(1, -1);
-    // Loon 也可能注入 JSON 字符串
     if ($argument.charAt(0) === "{") {
       try {
         return String(JSON.parse($argument).tokens || "");
       } catch (e) {}
     }
-    // Surge/Stash 风格 tokens=xxx&...
     var pairs = $argument.split("&");
     for (var i = 0; i < pairs.length; i++) {
       var idx = pairs[i].indexOf("=");
@@ -105,7 +101,6 @@ function getArgumentTokens() {
         return decodeURIComponent(pairs[i].slice(idx + 1));
       }
     }
-    // 直接把整串当 token 填的兜底（如 Loon argument="pgnfw_..."）
     if ($argument.indexOf("pgnfw_") === 0) return $argument;
   }
   return "";
@@ -119,7 +114,7 @@ function onCellular() {
       "";
     return iface.indexOf("pdp_ip") === 0;
   } catch (e) {
-    return false; // 客户端不支持 $network 时按非蜂窝处理
+    return false;
   }
 }
 
@@ -138,8 +133,6 @@ function finish(title, content, allOk) {
 
 /* ---------- 业务逻辑 ---------- */
 
-// 服务端按 C 段（/24）加白，条目可能是精确 IP 或 x.x.x.0/24。
-// 任一侧为 /24 段时按前三段比较，两侧均为精确 IP 时要求全等。
 function sameC24(a, b) {
   if (!a || !b) return false;
   a = String(a);
@@ -165,12 +158,17 @@ function readHistory(key) {
   }
 }
 
+// 适配新 API 传参结构
 function apiCall(token, slot) {
-  // token 走 URL 路径，命中 /add 即把当前出口 IP 加白；带 slot 则钉固定槽位
-  var url = API_BASE + encodeURIComponent(token) + "/add";
+  // 构建带有 slot 的 token 字符串
+  var fullToken = token;
   if (slot !== null && slot !== undefined && slot !== "") {
-    url += "?slot=" + encodeURIComponent(slot);
+    fullToken += "@" + slot;
   }
+
+  // 组装新接口 Query 参数
+  var url = API_BASE + "?action=add&token=" + encodeURIComponent(fullToken);
+
   return httpRequest("POST", {
     url: url,
     headers: { "Content-Type": "application/json" },
@@ -182,7 +180,7 @@ function apiCall(token, slot) {
     try {
       data = JSON.parse(r.body);
     } catch (e) {}
-    // 带槽位写入且本机 IP 已占用别的槽位 → 服务端 403 冲突，需去 UI 删旧槽位
+
     if (r.status === 403) {
       return {
         error: "槽位冲突：本机 IP 已在其它槽位，请先去 UI 删除",
@@ -191,7 +189,7 @@ function apiCall(token, slot) {
       };
     }
     if (!data) return { error: "响应异常: " + String(r.body).slice(0, 80) };
-    // whitelist 元素为 {ip, slot} 对象（旧版曾是纯 IP 字符串）：记下 ip→slot 再摊平成 IP 数组
+
     var raw = Array.isArray(data.whitelist) ? data.whitelist : [];
     data.slotOf = {};
     raw.forEach(function (e) {
@@ -217,7 +215,6 @@ function ensureWhitelisted(item, index) {
   var cellular = onCellular();
   var ctx = { kvState: kvState, kvHist: kvHist, slot: item.slot };
 
-  // 服务端对重复 IP 幂等，直接请求 /add 即可，无需先查
   return apiCall(item.token, item.slot).then(function (st) {
     if (st.applied) {
       var hist = readHistory(kvHist);
@@ -232,7 +229,6 @@ function ensureWhitelisted(item, index) {
   });
 }
 
-// 每 token 一行：不含 token，只含白名单/坑位信息；蜂窝加的 IP 标 📶
 function describe(index, ctx) {
   var st = ctx.st;
   var pin = ctx.slot !== null && ctx.slot !== undefined && ctx.slot !== "" ? " 📌" + ctx.slot : "";
@@ -256,8 +252,6 @@ function describe(index, ctx) {
   return head + "✅ " + st.whitelist.length + "/" + st.limit + "\n    " + ips;
 }
 
-// 分隔符兼容 , | ; 、；非 pgnfw_ 开头的段（如未修改的占位提示）直接忽略。
-// 每段可带可选 @槽位 后缀：pgnfw_xxx@0 → 钉槽位 0；无后缀则 slotless。
 var tokens = (getArgumentTokens() || storeRead(TOKENS_KEY) || INLINE_TOKENS || "")
   .split(/[,|;、\s]+/)
   .map(function (s) {
@@ -309,7 +303,6 @@ if (tokens.length === 0) {
       "po0 加白 " + okCount + "/" + results.length + " · 出口 " + exitIp + (onCellular() ? " 📶" : "");
     var content = lines.join("\n");
 
-    // 仅在出口 IP 或加白状态较上次变化时通知，例行 POST 保持安静
     if (changed) {
       notify("po0 防火墙加白", title, content);
     }
